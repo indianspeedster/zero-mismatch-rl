@@ -523,6 +523,12 @@ class MegatronLiteRuntime(RuntimeBase):
                 else:
                     load_optimizer(handle._optimizer)
 
+    def load_trainable_to_gpu(self, handle: ModelHandle) -> bool:
+        """Adapter export: onload only the trainable (DDP-buffer) parameters; False if unsupported (caller loads all)."""
+        from megatron.lite.runtime.megatron_utils import load_trainable_params_to_gpu
+
+        return load_trainable_params_to_gpu(handle._extras.get("model_chunks", [handle._model]))
+
     # ── Mode switching ──
 
     def train_mode(self, handle: ModelHandle):

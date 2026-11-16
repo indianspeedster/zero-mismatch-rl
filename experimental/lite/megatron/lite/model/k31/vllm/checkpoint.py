@@ -379,6 +379,38 @@ except ImportError:
 # The K31 adapter export can hand each rollout rank only its own experts (``lora_expert_slice``).
 SUPPORTS_LORA_EXPERT_SLICE = True
 
+# ``lora_expert_tp_slice=(tp_rank, tp_size)``: per-expert factors narrowed to the TP rank's shard (as vLLM's
+# FusedMoEWithLoRA shards them), headed by an int64 ``[tp_rank, tp_size]`` tag tensor with this name.
+LORA_EXPERT_TP_SLICE_TAG = "__k31_lora_expert_tp_slice__"
+SUPPORTS_LORA_EXPERT_TP_SLICE = True
+# (peft name suffix, dim vLLM shards over TP)
+_TP_SHARDED_EXPERT_LORA = (
+    (".experts.w1.lora_B.weight", 1),
+    (".experts.w3.lora_B.weight", 1),
+    (".experts.w2.lora_A.weight", 2),
+)
+
+
+def _tp_sharded_dim(peft: str) -> int | None:
+    for suffix, dim in _TP_SHARDED_EXPERT_LORA:
+        if peft.endswith(suffix):
+            return dim
+    return None
+
+
+def _tp_narrow(peft: str, tensor: torch.Tensor, tp_rank: int, tp_size: int) -> torch.Tensor:
+    """``tensor`` narrowed (contiguous copy) to ``tp_rank``'s shard if vLLM shards it over TP, else unchanged."""
+    dim = _tp_sharded_dim(peft)
+    if dim is None:
+        return tensor
+    if tensor.dim() != 3:
+        raise ValueError(f"lora_expert_tp_slice: {peft} is {tuple(tensor.shape)}, expected a 3D expert factor")
+    n = tensor.shape[dim]
+    if n % tp_size:
+        raise ValueError(f"lora_expert_tp_slice: {peft} dim {dim} = {n} is not divisible by TP {tp_size}")
+    s = n // tp_size
+    return tensor.narrow(dim, tp_rank * s, s).contiguous()
+
 
 @dataclass(frozen=True)
 class _ExpertExchange:
@@ -546,6 +578,11 @@ def export_hf_weights(
     (exchanged inside the actor EP group), headed by ``LORA_EXPERT_SLICE_TAG``; dense
     and shared outer factors are yielded whole either way.
 
+    With ``lora_expert_tp_slice=(rollout_tp_rank, rollout_tp_size)`` (rollout TP without
+    EP) every rank yields the whole adapter except that the per-expert factors vLLM shards
+    over TP (``w1/w3 lora_B`` dim 1, ``w2 lora_A`` dim 2) are narrowed to that TP rank's
+    shard, headed by ``LORA_EXPERT_TP_SLICE_TAG``.  The two slices are exclusive.
+
     With PP>1 every rank still yields the whole adapter (all stages, layer order): a
     stage broadcasts its dense/shared tensors over the PP group, and for per-expert
     factors either broadcasts the EP-gathered tensor or, sliced, exchanges inside its
@@ -558,6 +595,13 @@ def export_hf_weights(
     kwargs.pop("buffer_max_size_bytes", None)
     to_cpu = bool(kwargs.pop("cpu", False))
     expert_slice = kwargs.pop("lora_expert_slice", None)
+    tp_slice = kwargs.pop("lora_expert_tp_slice", None)
+    if expert_slice is not None and tp_slice is not None:
+        raise ValueError("lora_expert_slice and lora_expert_tp_slice are exclusive")
+    if tp_slice is not None:
+        tp_rank, tp_size = (int(v) for v in tp_slice)
+        if tp_size < 2 or not 0 <= tp_rank < tp_size:
+            raise ValueError(f"lora_expert_tp_slice: bad TP rank {tp_rank}/{tp_size}")
     export_dtype = kwargs.pop("export_dtype", None)
     if export_dtype is not None and str(export_dtype).removeprefix("torch.") not in (
         "bfloat16",
@@ -578,12 +622,17 @@ def export_hf_weights(
             [rollout_ep_rank, rollout_ep_size, model_cfg.num_experts], dtype=torch.int64
         )
         yield LORA_EXPERT_SLICE_TAG, tag if to_cpu else tag.cuda()
+    if tp_slice is not None:
+        tag = torch.tensor([tp_rank, tp_size], dtype=torch.int64)
+        yield LORA_EXPERT_TP_SLICE_TAG, tag if to_cpu else tag.cuda()
     if ps.pp_size <= 1:
         plan = plans[0] if plans is not None else None
         entries = (_export_entry(param, peft, kind, ps, plan) for _n, param, peft, kind in items)
     else:
         entries = _pipeline_entries(items, ps, plans)
     for peft, tensor in entries:
+        if tp_slice is not None:
+            tensor = _tp_narrow(peft, tensor, tp_rank, tp_size)
         yield peft, tensor.cpu() if to_cpu else tensor
 
 

@@ -525,6 +525,8 @@ class MegatronLiteEngine(BaseEngine):
             forward_only=forward_only,
         )
 
+    _rollout_weight_quantizer = None
+
     @property
     def supports_lora_expert_slice(self) -> bool:
         """Whether the weight-sync export can hand each rollout rank only its own experts.
@@ -534,10 +536,22 @@ class MegatronLiteEngine(BaseEngine):
         proto = self.handle._extras.get("protocol") if self.handle is not None else None
         return bool(getattr(proto, "SUPPORTS_LORA_EXPERT_SLICE", False))
 
+    @property
+    def supports_lora_expert_tp_slice(self) -> bool:
+        """Whether the weight-sync export can hand each rollout TP rank only its shard of the expert factors.
+
+        True when the model protocol supports it (K31 adapters; rollout TP without EP).
+        """
+        proto = self.handle._extras.get("protocol") if self.handle is not None else None
+        return bool(getattr(proto, "SUPPORTS_LORA_EXPERT_TP_SLICE", False))
+
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()
         if self.is_param_offload_enabled:
-            self.to("cuda", model=True, optimizer=False, grad=False)
+            # Adapter-only export: onload just the trainable parameters, not the frozen base.
+            loader = getattr(self.runtime, "load_trainable_to_gpu", None)
+            if not (self._exports_adapter_only() and callable(loader) and loader(self.handle)):
+                self.to("cuda", model=True, optimizer=False, grad=False)
         if not getattr(self, "_initial_sync_cache_cleared", False):
             aggressive_empty_cache(force_sync=True)
             self._initial_sync_cache_cleared = True
@@ -550,6 +564,10 @@ class MegatronLiteEngine(BaseEngine):
             if not self.supports_lora_expert_slice:
                 raise ValueError("lora_expert_slice given but this model cannot export expert slices")
             export_kwargs["lora_expert_slice"] = tuple(kwargs["lora_expert_slice"])
+        if kwargs.get("lora_expert_tp_slice") is not None:
+            if not self.supports_lora_expert_tp_slice:
+                raise ValueError("lora_expert_tp_slice given but this model cannot export TP-sliced experts")
+            export_kwargs["lora_expert_tp_slice"] = tuple(kwargs["lora_expert_tp_slice"])
         export_kwargs.update(
             buffer_max_size_bytes=2 * 1024**3,
             cpu=False,
@@ -582,7 +600,24 @@ class MegatronLiteEngine(BaseEngine):
                 "this model exports only its LoRA adapter; the rollout must load the base "
                 "checkpoint (rollout.load_format != dummy)"
             )
+        if (
+            peft_config is None
+            and self._rollout_weight_quantizer is not None
+            and not self.engine_config.qat.get("enable", False)
+        ):
+            # Full-weight exports only (adapters stay BF16); with QAT on, qat_export already quantized.
+            weights = self._rollout_weight_quantizer(weights)
         return weights, peft_config
+
+    def set_rollout_weight_quantizer(self, quantizer) -> None:
+        """verl's trainer-side rollout weight quantizer, applied to full-weight exports only."""
+        self._rollout_weight_quantizer = quantizer
+
+    def _exports_adapter_only(self) -> bool:
+        if os.environ.get("MLITE_EXPORT_FULL_ONLOAD", "0") == "1":
+            return False
+        proto = self.handle._extras.get("protocol")
+        return callable(getattr(proto, "export_peft_config", None))
 
     def get_data_parallel_size(self):
         if self.handle is None:

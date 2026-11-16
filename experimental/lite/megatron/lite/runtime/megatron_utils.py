@@ -260,6 +260,27 @@ def offload_model_to_cpu(
                 model_chunk.to("cpu")
 
 
+def load_trainable_params_to_gpu(model_list: list) -> bool:
+    """Onload only the trainable parameters (adapter-only weight export); frozen parameters and grads stay on CPU.
+
+    Returns False (nothing changed) for FSDP2 chunks; the caller then uses ``load_model_to_gpu``."""
+    if any(not _is_megatron_ddp(c) and _has_fsdp2(c) for c in model_list):
+        return False
+    for model_chunk in model_list:
+        if _is_megatron_ddp(model_chunk):
+            for buffers in (model_chunk.buffers, model_chunk.expert_parallel_buffers):
+                for buffer in buffers:
+                    if buffer.param_data.storage().size() == 0 and hasattr(buffer, "param_data_size"):
+                        buffer.param_data.storage().resize_(buffer.param_data_size)
+                        buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=True)
+        else:
+            for param in model_chunk.parameters():
+                if param.requires_grad and param.device.type != "cuda":
+                    param.data = param.data.to("cuda", non_blocking=True)
+    torch.cuda.synchronize()
+    return True
+
+
 def load_model_to_gpu(
     model_list: list,
     load_grad: bool = True,
