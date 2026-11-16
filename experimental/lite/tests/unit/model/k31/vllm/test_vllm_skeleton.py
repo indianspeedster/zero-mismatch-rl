@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
+from _tiny import TINY_TARGETS, tiny_config, tiny_lora
 from megatron.lite.model import registry
 from megatron.lite.model.k31.config import K31Config
 from megatron.lite.model.k31.vllm import checkpoint as ckpt
@@ -21,8 +21,6 @@ from megatron.lite.model.k31.vllm.model import (
 from megatron.lite.primitive.modules.lora import LoraConfig
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.runtime.contracts import ParallelConfig
-
-from _tiny import TINY_TARGETS, tiny_config, tiny_lora
 
 
 # --------------------------------------------------------------------------- registry
@@ -114,9 +112,18 @@ def test_contract_accepts_the_deployment_shape() -> None:
         "fsdp2-ep",
     ],
 )
-def test_contract_fails_closed(overrides, error) -> None:
-    with pytest.raises(error):
-        protocol._validate_contract(tiny_config(), _impl(**overrides))
+def test_contract_fails_closed(overrides, error, monkeypatch) -> None:
+    # The CUDA contract (the ROCm backend allows use_deepep=False: see test_rocm_backend_cpu.py).
+    from megatron.lite.primitive.kernels import k31_backend
+
+    monkeypatch.setenv("MLITE_K31_BACKEND", "vllm_cuda")
+    k31_backend.backend.cache_clear()
+    try:
+        with pytest.raises(error):
+            protocol._validate_contract(tiny_config(), _impl(**overrides))
+    finally:
+        monkeypatch.delenv("MLITE_K31_BACKEND")
+        k31_backend.backend.cache_clear()
 
 
 class TestSelectRouterLayers:
@@ -604,6 +611,16 @@ class TestRetiredEnv:
 
 
 class TestBatchInvarianceInit:
+    @pytest.fixture(autouse=True)
+    def _cuda_backend(self, monkeypatch):
+        """The CUDA init path (ROCm init: test_rocm_backend_cpu.py)."""
+        from megatron.lite.primitive.kernels import k31_backend
+
+        monkeypatch.setenv("MLITE_K31_BACKEND", "vllm_cuda")
+        k31_backend.backend.cache_clear()
+        yield
+        k31_backend.backend.cache_clear()
+
     def test_cublas_check_reads_startup_values_not_vllm_rewrite(self, monkeypatch) -> None:
         from megatron.lite.model.k31.vllm import runtime_metadata as rm
 
