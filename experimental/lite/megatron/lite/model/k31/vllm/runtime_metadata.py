@@ -28,6 +28,7 @@ from typing import Any, Iterator
 import torch
 import torch.distributed as dist
 
+from megatron.lite.primitive.kernels import k31_backend
 from megatron.lite.primitive.kernels.vllm_k31 import _k31_module, _symbol, k31_vllm_package
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.runtime.contracts.config import refuse_retired_env
@@ -131,6 +132,10 @@ def initialize_k31_vllm_batch_invariance() -> None:
     if _INITIALIZED:
         return
     _check_retired_env()
+    if k31_backend.is_rocm():
+        _initialize_rocm()
+        _INITIALIZED = True
+        return
     batch_invariant = bool(importlib.import_module("vllm.envs").VLLM_BATCH_INVARIANT)
     if batch_invariant:
         _check_env()
@@ -162,6 +167,87 @@ def initialize_k31_vllm_batch_invariance() -> None:
         if torch.backends.cuda.matmul.fp32_precision != "ieee":
             raise RuntimeError("BI init did not pin FP32 matmul precision to IEEE")
     _INITIALIZED = True
+
+
+# Retired ROCm switches (behavior follows VLLM_BATCH_INVARIANT): only the fixed BI value is accepted, else fail closed.
+_ROCM_RETIRED_BI = {
+    "MLITE_K31_DENSE_BI": "1",
+    "MLITE_K31_KDA_BI": "1",
+    "MLITE_K31_MOE_BI": "1",
+    "MLITE_K31_BI_BMM": "1",
+    "MLITE_K31_BI_MM_NP": "1",
+    "MLITE_K31_ROCM_OPS": "vllm",
+    "MLITE_K31_DSA_IMPL": "rocm",
+    "MLITE_K31_DSA_INDEXER": "rollout_bi",
+    "MLITE_K31_DSA_SPARSE": "rollout_bi",
+    "MLITE_K31_DSA_KV_FP8": "ds_mla",
+    "MLITE_K31_DSA_BI_BWD": "segsum",
+    "MLITE_K31_MOE_DISPATCH_BWD": "ordered",
+    "MLITE_K31_MOE_LEAF_BWD": "ordered",
+}
+_ROCM_RETIRED = (
+    "MLITE_K31_TRAIN",
+    "MLITE_K31_TRAIN_FREEZE",
+    "MLITE_K31_BI_MM_NP_MIN_M",
+    "MLITE_K31_DSA_BWD_MASKFILL",
+    "MLITE_K31_MILES_PATH",
+    "MLITE_K31_ROCM_GEMM_PAD",
+    "MLITE_K31_ROCM_ROUTER",
+    "MLITE_K31_ROCM_ANY_HIDDEN",
+    "MLITE_K31_ROCM_KDA",
+    "MLITE_K31_ROCM_KDA_AUTOGRAD",
+    "MLITE_K31_ROCM_KDA_BACKEND",
+    "MLITE_K31_ROCM_DGRAD",
+    "MLITE_K31_ROCM_MOE_ACT_QUANT",
+    "MLITE_K31_ROCM_ACT_QUANT_SCALE",
+    "MLITE_K31_ROCM_MOE_CHUNK_ROWS",
+    "MLITE_K31_ROCM_MOE_CHUNK_EXPERTS",
+    "MLITE_K31_ROCM_DEQUANT",
+)
+# Rollout-plugin switches the trainer mirrors; under BI only their fixed value is accepted (the plugin pins the same).
+_PLUGIN_PINNED_BI = {"K31_BI_LORA_F32ADD": "1", "K31_BI_ATTNRES": "1", "K31_BI_ATTNRES_CFG": "1,4"}
+
+
+def _check_rocm_env(bi: bool) -> None:
+    bad = [f"{k}={os.environ[k]!r}" for k in _ROCM_RETIRED if os.environ.get(k, "") != ""]
+    for k, want in _ROCM_RETIRED_BI.items():
+        got = os.environ.get(k, "")
+        if got != "" and (not bi or got != want):
+            bad.append(f"{k}={got!r}")
+    if bi:
+        bad += [f"{k}={os.environ[k]!r}" for k, want in _PLUGIN_PINNED_BI.items()
+                if os.environ.get(k, "") not in ("", want)]
+    if bad:
+        raise RuntimeError(
+            "K31 ROCm: retired switches set (behavior now follows VLLM_BATCH_INVARIANT"
+            f"={int(bi)}): {', '.join(bad)}; unset them"
+        )
+    vtp = os.environ.get("MLITE_K31_BI_VTP", "")
+    if bi and vtp not in ("", "0", "1"):
+        if not vtp.isdigit():
+            raise RuntimeError(f"MLITE_K31_BI_VTP must be the rollout's TP size, got {vtp!r}")
+        tp = os.environ.get("ROLLOUT_TP", "")
+        if tp and tp != vtp:
+            raise RuntimeError(f"MLITE_K31_BI_VTP={vtp} differs from ROLLOUT_TP={tp}: the trainer must mirror the rollout's TP")
+
+
+def _initialize_rocm() -> None:
+    """ROCm trainer init. Under BI the forward calls the rollout's BI kernels explicitly (no aten overrides)."""
+
+    bi = k31_backend.bi()
+    _check_rocm_env(bi)
+    if bi:
+        for mod in ("k31kdabi", "k31lora.bi_moe"):
+            try:
+                importlib.import_module(mod)
+            except ImportError as exc:
+                raise RuntimeError(f"VLLM_BATCH_INVARIANT=1 on ROCm needs {mod} on PYTHONPATH") from exc
+        torch.backends.cuda.matmul.allow_tf32 = False
+        # Non-persistent BI dense GEMM for M >= 1024 (bitwise equal to vLLM's matmul_persistent).
+        from megatron.lite.primitive.kernels import k31_bi_mm_np
+
+        k31_bi_mm_np.install(min_m=1024)
+    _check_no_cublas_env()
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +310,10 @@ def k31_vllm_forward_context(
     input_ids = getattr(batch, "input_ids", None)
     if not isinstance(input_ids, torch.Tensor):
         raise TypeError("K31 vLLM batches require tensor input_ids")
+    if k31_backend.is_rocm():
+        # The ROCm MoE path reads no vLLM forward context (DPMetadata).
+        yield
+        return
     local = int(getattr(batch, "total_tokens", None) or input_ids.numel())
     if local <= 0:
         raise ValueError("K31 vLLM batches must contain at least one token")

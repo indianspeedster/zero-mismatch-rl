@@ -71,6 +71,7 @@ class K31KDAAttention(nn.Module):
         )
         self.f_b_proj = K31Linear(d, (p,), ("f_b_proj",), lora=lora)
         self.o_proj = K31Linear(p, (h,), ("o_proj",), lora=lora)
+        self.o_proj.row_parallel = True
         self.conv1d = _Weight(3 * p, 1, config.kda_short_conv_kernel_size, dtype=torch.float32)
         self.A_log = nn.Parameter(torch.empty(config.kda_num_heads, dtype=torch.float32))
         self.dt_bias = nn.Parameter(torch.empty(p, dtype=torch.float32))

@@ -12,10 +12,12 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.model.k31.config import K31Config
+from megatron.lite.primitive.kernels import k31_backend
 from megatron.lite.model.k31.vllm.checkpoint import (
     EXPERT_CLASSIFIER,
     PLACEMENT_FN,
     SUPPORTS_LORA_EXPERT_SLICE,
+    SUPPORTS_LORA_EXPERT_TP_SLICE,
     export_hf_weights,
     load_hf_weights,
     load_lora_adapter,
@@ -391,7 +393,8 @@ def _validate_contract(model_cfg: K31Config, impl_cfg: ImplConfig) -> None:
         )
     if parallel.ep <= 0 or model_cfg.num_experts % parallel.ep:
         raise ValueError(f"EP={parallel.ep} must divide {model_cfg.num_experts} routed experts.")
-    if not impl_cfg.use_deepep:
+    if not impl_cfg.use_deepep and not k31_backend.is_rocm():
+        # ROCm: no DeepEP; the MoE uses the torch all-to-all ("nccl" -> RCCL) transport.
         raise NotImplementedError("K31 vLLM requires normal DeepEP training transport.")
     if impl_cfg.mtp_enable:
         raise NotImplementedError("K31 vLLM does not support MTP.")
@@ -791,6 +794,7 @@ __all__ = [
     "ImplConfig",
     "PLACEMENT_FN",
     "SUPPORTS_LORA_EXPERT_SLICE",
+    "SUPPORTS_LORA_EXPERT_TP_SLICE",
     "SelectorConfig",
     "build_attention_metadata",
     "build_model",

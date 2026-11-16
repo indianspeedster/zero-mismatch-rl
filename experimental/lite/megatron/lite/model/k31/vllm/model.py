@@ -41,7 +41,7 @@ from megatron.lite.model.k31.vllm.primitive import (
     visible_lora_linear,
 )
 from megatron.lite.model.k31.vllm.runtime_metadata import K31Runtime
-from megatron.lite.primitive.kernels.vllm_k31 import (
+from megatron.lite.primitive.kernels.k31_backend import (
     AttnResAdapter,
     BILinearAdapter,
     LoRALeafAdapter,
@@ -170,6 +170,7 @@ class K31Linear(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(sum(self.slice_sizes), self.in_features, dtype=torch.bfloat16)
         )
+        self.row_parallel = False  # vLLM RowParallelLinear (o_proj, down_proj): virtual TP reproduces its rank partials
         self.lora: LoRAProjection | None = None
         if lora is not None and lora.wants(self.slice_names):
             self.lora = LoRAProjection(
@@ -184,17 +185,35 @@ class K31Linear(nn.Module):
 
     def forward(self, value: torch.Tensor, runtime: K31Runtime | None = None) -> torch.Tensor:
         if self.lora is None:
-            return visible_linear(BILinearAdapter(), value, self.weight)
+            op = BILinearAdapter()
+            op.row_parallel = self.row_parallel
+            return visible_linear(op, value, self.weight)
         if runtime is None or runtime.lora_meta is None:
             raise RuntimeError("LoRA-wrapped projection requires runtime.lora_meta")
+        leaf = LoRALeafAdapter()
+        leaf.row_parallel = self.row_parallel
         return visible_lora_linear(
             PunicaLoRADeltaAdapter(),
-            LoRALeafAdapter(),
+            leaf,
             value,
             self.weight,
             self.lora,
             runtime.lora_meta,
         )
+
+    def vtp_partials(self, value: torch.Tensor, runtime: K31Runtime | None, n: int) -> torch.Tensor:
+        """No-grad values: the TP=n rollout ranks' un-reduced partials ``[n, T, out]`` of this row-parallel layer."""
+
+        from megatron.lite.primitive.kernels import rocm_k31
+        from megatron.lite.model.k31.vllm.primitive.linear import _stack_vllm
+
+        x2 = value.detach().reshape(-1, value.shape[-1]).contiguous()
+        with torch.no_grad():
+            if self.lora is None:
+                return rocm_k31.vtp_row_partials(x2, self.weight.detach(), n)
+            a_st, b_st = _stack_vllm(self.lora.a_params(), self.lora.b_params(), self.lora.scaling, self.lora.max_rank)
+            return rocm_k31.vtp_row_partials(x2, self.weight.detach(), n,
+                                             lora=(a_st, b_st, tuple(self.lora.slice_sizes), runtime.lora_meta))
 
 
 class K31RMSNorm(nn.Module):
@@ -229,6 +248,7 @@ class K31DenseMLP(nn.Module):
             lora=lora,
         )
         self.down_proj = K31Linear(intermediate_size, (hidden_size,), ("down_proj",), lora=lora)
+        self.down_proj.row_parallel = True
 
     def forward(self, value: torch.Tensor, runtime: K31Runtime | None = None) -> torch.Tensor:
         gate_up = self.gate_up_proj(value, runtime)
@@ -322,7 +342,10 @@ def capture_forward_context():
     installed theirs.
     """
 
-    module = importlib.import_module("vllm.forward_context")
+    try:
+        module = importlib.import_module("vllm.forward_context")
+    except ImportError:
+        return None
     context = getattr(module, "_forward_context", None)
     if context is None:
         return None

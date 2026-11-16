@@ -217,8 +217,15 @@ class _VLLMLoRALinearFunction(torch.autograd.Function):
         x2d = value.reshape(-1, value.shape[-1])
         if not x2d.is_contiguous():
             x2d = x2d.contiguous()
-        delta = delta_op(x2d, a_stacked, b_stacked, tuple(slice_sizes), meta)
-        output = own_visible_tensor(leaf_op(x2d, master_weight, delta))
+        fused = getattr(leaf_op, "fused_lora", None)
+        if fused is not None and fused():
+            # ROCm BI: the rollout's punica add_lora_linear on the BI base output, in one leaf (no separate delta)
+            output = own_visible_tensor(
+                leaf_op.fused_forward(x2d, master_weight, a_stacked, b_stacked, tuple(slice_sizes), meta)
+            )
+        else:
+            delta = delta_op(x2d, a_stacked, b_stacked, tuple(slice_sizes), meta)
+            output = own_visible_tensor(leaf_op(x2d, master_weight, delta))
         output = output.reshape(*value.shape[:-1], output.shape[-1])
         ctx.save_for_backward(value, *factors)
         ctx.master_weight = master_weight

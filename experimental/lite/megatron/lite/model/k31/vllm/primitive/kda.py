@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.lite.primitive.kernels import k31_backend
 from megatron.lite.primitive.kernels.vllm_k31 import (
     KDA_CONV_WIDTH,
     KDA_HEAD_DIM,
@@ -168,7 +169,19 @@ def pin_fla_autotune() -> dict[str, str]:
                 tuner.configs = [tuner.configs[0]]
                 tuner._k31_pinned = True
             _PINNED[f"{name}.{attr}"] = str(tuner.configs[0])
+    if _kda_bi_fla_fix_wanted() and "k31kdabi_fla_fix" not in _PINNED:
+        # BI KDA: use the rollout's k31kdabi FLA intra-chunk forward kernel (bitwise equal to the rollout).
+        try:
+            from k31kdabi import apply_bi_fla_fix
+        except ImportError as exc:
+            raise RuntimeError("VLLM_BATCH_INVARIANT=1 on ROCm needs the k31kdabi plugin on PYTHONPATH") from exc
+        _PINNED["k31kdabi_fla_fix"] = apply_bi_fla_fix()
     return dict(_PINNED)
+
+
+def _kda_bi_fla_fix_wanted() -> bool:
+    # ROCm BI: the rollout's k31kdabi FLA intra-chunk fix (bitwise KDA forward)
+    return k31_backend.is_rocm() and k31_backend.bi()
 
 
 def _token_positions(cu_seqlens: Tensor, total: int, device) -> Tensor:
@@ -255,6 +268,12 @@ def kda_core(
     gradients only if they require grad (K31 RL freezes them; LoRA lives in the projections)."""
 
     pin_fla_autotune()
+
+    if k31_backend.is_rocm():
+        # ROCm: one FLA call under autograd (visible forward and recompute are the same function).
+        return fla_functional(cfg, cu_seqlens)(
+            mixed_qkv, g1, beta, g2, conv_weight, A_log, dt_bias, norm_weight
+        )
 
     def visible(*inputs):
         return kda_visible(cfg, *inputs, cu_seqlens)
