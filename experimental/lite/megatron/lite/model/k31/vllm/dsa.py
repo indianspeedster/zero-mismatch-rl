@@ -29,6 +29,7 @@ import torch.nn as nn
 
 from megatron.lite.model.k31.config import K31Config
 from megatron.lite.model.k31.vllm.model import K31Linear, K31LoRASpec
+from megatron.lite.model.k31.vllm.primitive import dsa_rocm
 from megatron.lite.model.k31.vllm.primitive.attention import (
     absorbed_weights,
     attention_core,
@@ -41,10 +42,11 @@ from megatron.lite.model.k31.vllm.runtime_metadata import (
     K31Runtime,
     initialize_k31_vllm_batch_invariance,
 )
+from megatron.lite.primitive.kernels import k31_backend
+from megatron.lite.primitive.kernels.k31_backend import RMSNormAdapter
 from megatron.lite.primitive.kernels.vllm_k31 import (
     DSA_BLOCK_SIZE,
     FP8_DS_MLA_TOKEN_BYTES,
-    RMSNormAdapter,
     _symbol,
 )
 from megatron.lite.primitive.parallel import ParallelState
@@ -103,13 +105,17 @@ class K31DSAAttention(nn.Module):
         )
         self.g_proj = K31Linear(h, (heads * config.v_head_dim,), ("g_proj",), lora=lora)
         self.o_proj = K31Linear(heads * config.v_head_dim, (h,), ("o_proj",), lora=lora)
+        # vLLM RowParallelLinear (mirrored under MLITE_K31_BI_VTP=N).
+        self.o_proj.row_parallel = True
         self.indexer = _Indexer(config)
 
     def forward(
         self, hidden_states: torch.Tensor, *, metadata: Any, runtime: K31Runtime
     ) -> torch.Tensor:
-        if not isinstance(metadata, K31DSARuntimeMetadata):
-            raise TypeError("K31 DSA layers need K31DSARuntimeMetadata (build_dsa_metadata)")
+        if not isinstance(metadata, (K31DSARuntimeMetadata, dsa_rocm.K31DSARocmMetadata)):
+            raise TypeError(
+                "K31 DSA layers need K31DSARuntimeMetadata or K31DSARocmMetadata (build_dsa_metadata)"
+            )
         cfg = self.config
         if not cfg.mla_use_nope or not cfg.mla_use_output_gate:
             raise NotImplementedError("K31 DSA forward is ported for NoPE + output gate only")
@@ -165,6 +171,7 @@ class K31DSAAttention(nn.Module):
             softmax_scale=(nope + rope) ** -0.5,
             qk_nope_head_dim=nope,
             padded_heads=_padded_heads(heads),
+            backward_op=adapters.backward,
         )
         gated = output_gate(attn, self.g_proj(hidden_states, runtime))
         return self.o_proj(gated, runtime)
@@ -366,7 +373,7 @@ def initialize_k31_dsa_runtime(device: torch.device | str) -> None:
 
 def build_dsa_metadata(
     runtime: K31Runtime, *, max_model_len: int, topk: int = 2048, layer_name: str = "k31.dsa"
-) -> K31DSARuntimeMetadata:
+) -> K31DSARuntimeMetadata | dsa_rocm.K31DSARocmMetadata:
     """DSA metadata for one packed microbatch.
 
     One object may serve every DSA layer of the microbatch: each call rewrites
@@ -375,6 +382,9 @@ def build_dsa_metadata(
     """
 
     device = runtime.cu_seqlens.device
+    if k31_backend.is_rocm():
+        # ROCm: one fp8_ds_mla cache row per packed token (dsa_rocm.K31DSARocmMetadata).
+        return dsa_rocm.build_dsa_rocm_metadata(list(runtime.seq_lens), device=device, topk=topk)
     initialize_k31_dsa_runtime(device)
     return K31DSAMetadataBuilder(device=device, max_model_len=max_model_len, topk=topk).build(
         list(runtime.seq_lens), layer_name=layer_name

@@ -42,9 +42,16 @@ class DSAAdapters:
     sparse: Any
     upconvert: Any
     bmm: Any
+    backward: Any = None  # sparse-attention VJP; None: default_sparse_backward (cuDNN)
 
 
 def default_dsa_adapters() -> DSAAdapters:
+    from megatron.lite.primitive.kernels import k31_backend
+
+    if k31_backend.is_rocm():
+        from megatron.lite.model.k31.vllm.primitive import dsa_rocm
+
+        return dsa_rocm.dsa_adapters()
     from megatron.lite.primitive.kernels.vllm_k31 import (
         DSAAbsorbBmmAdapter,
         DSAFP8KVUpconvertAdapter,
