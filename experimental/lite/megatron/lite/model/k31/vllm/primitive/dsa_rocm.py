@@ -110,6 +110,17 @@ def build_dsa_rocm_metadata(
 # ---------------------------------------------------------------------------
 # indexer: causal top-k (frozen, forward only)
 # ---------------------------------------------------------------------------
+def _bi_dsa():
+    """The rollout's batch-invariant DSA (k31dsabi, kimi-k31-rocm-vllm-plugins), with its vLLM hooks in this process."""
+    try:
+        k31dsabi = importlib.import_module("k31dsabi")
+        indexer = importlib.import_module("k31dsabi.indexer")
+    except ImportError as e:
+        raise NotImplementedError("rollout_bi DSA needs the k31dsabi vLLM plugin (kimi-k31-rocm-vllm-plugins)") from e
+    k31dsabi.register()
+    return indexer
+
+
 def _index_k_norm(k_lin, weight, bias, eps):
     """The rollout's indexer k LayerNorm: bf16 affine, fp32 accumulation."""
     d = k_lin.shape[-1]
@@ -157,8 +168,7 @@ def rollout_bi_indexer_topk(
     ).per_token_group_quant_fp8
     rs = importlib.import_module("vllm.v1.attention.ops.rocm_aiter_mla_sparse")
     weights_kernel = importlib.import_module("vllm.models.kimi_k3.amd.dsa")._index_weights_kernel
-    if not hasattr(rs, "dsv4_det_topk_per_row"):
-        raise NotImplementedError("rollout_bi indexer needs the vLLM BI DSA patch (vllm-k31-bi-01)")
+    bi = _bi_dsa()
     T = index_q.shape[0]
     dev = index_q.device
     index_k = _index_k_norm(k_lin, k_norm_weight, k_norm_bias, k_norm_eps)
@@ -182,9 +192,9 @@ def rollout_bi_indexer_topk(
         s0 = cu[r]
         ks = torch.zeros(n, dtype=torch.int32, device=dev)
         ke = torch.arange(1, n + 1, dtype=torch.int32, device=dev)
-        logits = rs._bi_fp8_mqa_logits(q_fp8[s0 : s0 + n], (k_fp8[s0 : s0 + n], k_scale[s0 : s0 + n]),
+        logits = bi._bi_fp8_mqa_logits(q_fp8[s0 : s0 + n], (k_fp8[s0 : s0 + n], k_scale[s0 : s0 + n]),
                                        w[s0 : s0 + n], ks, ke)
-        rs.dsv4_det_topk_per_row(logits, ks, ke, out[s0 : s0 + n], n, topk)
+        bi.dsv4_det_topk_per_row(logits, ks, ke, out[s0 : s0 + n], n, topk)
     return out
 
 
@@ -257,6 +267,7 @@ class DSASparseMLAAdapter:
 
     def __call__(self, q, mla_cache, rows, *, softmax_scale, padded_heads, cache_lens, dummy_block_table):
         del padded_heads, cache_lens, dummy_block_table  # FlashMLA-only arguments
+        _bi_dsa()  # no FlyDSL, kv_splits=1
         aiter_ops = importlib.import_module("vllm._aiter_ops").rocm_aiter_ops
         T, H, D = q.shape
         if D != HEAD_DIM:
