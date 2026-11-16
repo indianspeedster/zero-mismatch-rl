@@ -31,7 +31,11 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from megatron.lite.primitive.kernels.vllm_k31_moe import tree16_root
+from megatron.lite.primitive.kernels import k31_backend
+
+
+def tree16_root(leaves: Tensor) -> Tensor:
+    return k31_backend.moe_kernels().tree16_root(leaves)
 
 _TOKEN_SHIFT = 5  # slot k < 32
 _RANK_SHIFT = 40
@@ -121,6 +125,15 @@ class _NCCLTokenDispatch(torch.autograd.Function):
         g_send = g_hidden if g_hidden.dtype == torch.bfloat16 else g_hidden.float()
         back_h = _a2a(g_send, ctx.send_l, ctx.recv_l, ctx.group).float()
         back_w = _a2a(g_weights.float(), ctx.send_l, ctx.recv_l, ctx.group)
+        if k31_backend.is_rocm():
+            # ROCm: fixed-order sum of each token's EP-rank copies (deterministic, no atomics)
+            from megatron.lite.primitive.kernels.k31_segsum import segsum_index_add_
+
+            dh = torch.zeros((t, h), dtype=torch.float32, device=dev)
+            segsum_index_add_(dh, tok_idx, back_h)
+            dw = torch.zeros((t, k), dtype=torch.float32, device=dev)
+            segsum_index_add_(dw, tok_idx, back_w)
+            return dh.to(torch.bfloat16), dw, None, None, None
         dh = torch.zeros((t, h), dtype=torch.float32, device=dev).index_add_(0, tok_idx, back_h)
         dw = torch.zeros((t, k), dtype=torch.float32, device=dev).index_add_(0, tok_idx, back_w)
         return dh.to(torch.bfloat16), dw, None, None, None

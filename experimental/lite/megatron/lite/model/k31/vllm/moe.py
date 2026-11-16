@@ -67,8 +67,9 @@ from megatron.lite.primitive.alignment.vllm_fi_w4a16_moe import (
     VLLMFiW4A16LeafRowsFunction,
     expert_backward_rows,
 )
+from megatron.lite.primitive.kernels import k31_backend
 from megatron.lite.primitive.kernels import vllm_k31_moe as K
-from megatron.lite.primitive.kernels.vllm_k31 import BIRouterAdapter, RMSNormAdapter
+from megatron.lite.primitive.kernels.k31_backend import BIRouterAdapter, RMSNormAdapter
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import active_recompute_tape
 
@@ -118,6 +119,8 @@ def default_ep_transport(num_experts: int, ep_size: int) -> str:
 
     if ep_size <= 1:
         return "local"
+    if k31_backend.is_rocm():
+        return "nccl"  # no DeepEP on ROCm: torch all-to-all over RCCL
     if num_experts // ep_size > DEEPEP_MAX_LOCAL_EXPERTS:
         return "nccl"
     nvl = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -192,6 +195,11 @@ class K31RoutedExperts(nn.Module):
             self.lora_w1_B = nn.Parameter(torch.zeros(e, inter, r, dtype=bf16))
             self.lora_w3_B = nn.Parameter(torch.zeros(e, inter, r, dtype=bf16))
             self.lora_w2_A = nn.Parameter(torch.empty(e, r, inter, dtype=bf16))
+            if k31_backend.is_rocm():
+                # kaiming A, zero B (as the dense LoRAProjection)
+                with torch.no_grad():
+                    for a in (self.lora_w1_A, self.lora_w3_A, self.lora_w2_A):
+                        nn.init.kaiming_uniform_(a.view(-1, a.shape[-1]), a=5**0.5)
         self._fi: K.FiW4A16Experts | None = None
         self._fi_key: tuple | None = None
 
@@ -214,6 +222,34 @@ class K31RoutedExperts(nn.Module):
                 self.w2_weight_packed,
                 self.w2_weight_scale,
             )
+        )
+
+    def rocm_experts(self):
+        """Checkpoint MXFP4 buffers as the ROCm expert path reads them (no layout rewrite)."""
+
+        from megatron.lite.primitive.alignment.rocm_mxfp4_moe import RocmMxfp4Experts
+
+        return RocmMxfp4Experts(
+            ckpt_w13=self.w13_weight_packed,
+            ckpt_w13_scale=self.w13_weight_scale,
+            ckpt_w2=self.w2_weight_packed,
+            ckpt_w2_scale=self.w2_weight_scale,
+            num_experts=self.num_experts,
+            local_offset=self.local_offset,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
+        )
+
+    def _lora_tuple(self):
+        if not self.has_lora:
+            return None
+        return (
+            self.lora_w1_A[0],
+            self.lora_w3_A[0],
+            self.lora_w1_B,
+            self.lora_w3_B,
+            self.lora_w2_A,
+            self.lora_w2_B[0],
         )
 
     @property
@@ -241,6 +277,10 @@ class K31RoutedExperts(nn.Module):
     def stored(self, latent: Tensor, sent, plan) -> Tensor:
         """The forward's routed latent with the autograd graph of experts + combine (recompute only)."""
 
+        if k31_backend.is_rocm():
+            # ROCm: the expert forward is cheap relative to its backward; rebuild the graph.
+            del latent
+            return _CanonicalCombine.apply(self.leaf_rows(sent, plan), plan)
         return _StoredExpertsLatent.apply(
             latent,
             self.fi,
@@ -263,6 +303,18 @@ class K31RoutedExperts(nn.Module):
         Only the routed rows are written (``L`` = local routes), not a dense ``[n, top_k, H]`` slot
         tensor of the received tokens (26 GB at EP8 with a 16k-token micro-batch)."""
 
+        if k31_backend.is_rocm():
+            from megatron.lite.primitive.alignment.rocm_mxfp4_moe import rocm_expert_leaf_rows
+
+            return rocm_expert_leaf_rows(
+                self.rocm_experts(),
+                plan.expert_rows,
+                sent.hidden,
+                sent.topk_ids,
+                sent.topk_weights,
+                scaling=self.lora_scaling,
+                lora=self._lora_tuple(),
+            )
         if not self.has_lora:
             # RL always serves the adapter; the no-LoRA FI branch is a different
             # rollout pipeline (fused finalize) and is deliberately not ported.
@@ -332,7 +384,7 @@ class K31MoE(nn.Module):
     def _selection(self):
         if self._router is None:
             cfg = self.config
-            self._router = K.build_k31_router(
+            self._router = k31_backend.moe_kernels().build_k31_router(
                 top_k=cfg.num_experts_per_token,
                 num_experts=cfg.num_experts,
                 e_score_correction_bias=self.gate.e_score_correction_bias.detach(),
@@ -431,9 +483,14 @@ class K31MoE(nn.Module):
         normed = rms_norm(
             RMSNormAdapter(), latent, self.routed_expert_norm.weight, self.config.rms_norm_eps
         )
-        routed = visible_linear(K.MoELatentUpAdapter(), normed, self.routed_expert_up_proj.weight)
+        routed = visible_linear(
+            k31_backend.moe_kernels().MoELatentUpAdapter(), normed, self.routed_expert_up_proj.weight
+        )
         shared = self.shared_experts(hidden_states, runtime)
         out = routed + shared
+        n_vtp = k31_backend.moe_kernels().vtp_size() if k31_backend.is_rocm() else 1
+        if n_vtp > 1:
+            out = self._vtp_tail(out, hidden_states, normed, runtime, n_vtp)
         return out, {
             "logits": logits,
             "weights": weights,
@@ -444,6 +501,31 @@ class K31MoE(nn.Module):
             "upmm": routed,
             "shared": shared,
         }
+
+    def _vtp_tail(self, reference: Tensor, hidden_states: Tensor, normed: Tensor, runtime, n: int) -> Tensor:
+        """Value of a TP=n BI rollout's latent-MoE tail: each rank adds its BF16 routed up-projection shard
+        to the shared experts' partial, then a fixed-order all-reduce.  Grads flow through ``reference``."""
+
+        from megatron.lite.model.k31.vllm.model import SiTUAndMulAdapter, _ForwardValue
+        from megatron.lite.model.k31.vllm.primitive import situ_and_mul
+
+        RK = k31_backend.moe_kernels()
+        se = self.shared_experts
+        with torch.no_grad():
+            gate_up = se.gate_up_proj(hidden_states.detach(), runtime)
+            act = situ_and_mul(SiTUAndMulAdapter(), gate_up, beta=se.beta, linear_beta=se.linear_beta)
+            parts = se.down_proj.vtp_partials(act, runtime, n)  # [n, T, H]
+            w_up = self.routed_expert_up_proj.weight.detach()
+            h = w_up.shape[0]
+            if h % n:
+                raise ValueError(f"virtual TP={n} does not divide the hidden size {h}")
+            s = h // n
+            nrm = normed.detach().reshape(-1, normed.shape[-1])
+            for r in range(n):
+                hs = slice(r * s, (r + 1) * s)
+                parts[r, :, hs] = RK.rocm_linear(nrm, w_up[hs].contiguous()) + parts[r, :, hs]
+            value = RK.vtp_fixed_sum(parts)
+        return _ForwardValue.apply(reference, value.reshape(reference.shape).to(reference.dtype))
 
     def forward(
         self,
